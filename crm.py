@@ -3,22 +3,58 @@ import json
 import time
 import queue
 import threading
+import logging
 import requests
+
 from datetime import datetime
 from fastapi import APIRouter, Request
+from fastapi.responses import PlainTextResponse, JSONResponse
 from dotenv import load_dotenv
+
 from database import Database
 
 load_dotenv()
 
-router = APIRouter(prefix="/crm", tags=["CRM"])
+# =========================================================
+# SIMPLE LOGGER
+# =========================================================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
+logger = logging.getLogger("crm")
 
-VERIFY_TOKEN = os.getenv("VERIFY_TOKEN", "")
-USER_ACCESS_TOKEN = os.getenv("USER_ACCESS_TOKEN", "")
 
-# ================================
+def log(msg):
+    logger.info(msg)
+
+
+def log_error(msg):
+    logger.error(msg)
+
+
+# =========================================================
+# ROUTER
+# =========================================================
+router = APIRouter(tags=["CRM"])
+
+
+# =========================================================
+# ENV
+# =========================================================
+VERIFY_TOKEN = os.getenv("VERIFY_TOKEN", "").strip()
+USER_ACCESS_TOKEN = os.getenv("USER_ACCESS_TOKEN", "").strip()
+
+if not VERIFY_TOKEN:
+    log("⚠ VERIFY_TOKEN missing")
+
+if not USER_ACCESS_TOKEN:
+    log("⚠ USER_ACCESS_TOKEN missing")
+
+
+# =========================================================
 # SETTINGS
-# ================================
+# =========================================================
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "50"))
 WORKER_COUNT = int(os.getenv("WORKER_COUNT", "4"))
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "40"))
@@ -26,10 +62,26 @@ POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "600"))
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
 BUFFER_FLUSH_SECONDS = int(os.getenv("BUFFER_FLUSH_SECONDS", "10"))
 
-# ================================
+# DB SAFE LENGTHS (adjust if needed)
+MAX_FORM_NAME = 255
+MAX_NAME = 255
+MAX_PHONE = 50
+MAX_EMAIL = 255
+MAX_CITY = 150
+MAX_TRAVEL_DATE = 100
+MAX_CONTACT_MODE = 100
+MAX_TRAVELLERS = 100
+MAX_PLATFORM = 50
+MAX_AD_NAME = 255
+MAX_ADSET_NAME = 255
+MAX_CAMPAIGN_NAME = 255
+
+
+# =========================================================
 # RUNTIME
-# ================================
+# =========================================================
 PAGE_TOKENS = {}
+PAGE_NAMES = {}
 FORM_NAME_CACHE = {}
 LEAD_QUEUE = queue.Queue(maxsize=50000)
 INSERT_BUFFER = []
@@ -38,84 +90,103 @@ WORKERS_STARTED = False
 IMPORT_DONE = False
 LAST_PAGE_REFRESH = 0
 FLUSHER_STARTED = False
+POLLING_STARTED = False
 
 
-# --------------------------------
-# LOGGER
-# --------------------------------
-def log(msg):
-    print(msg, flush=True)
+# =========================================================
+# HELPERS
+# =========================================================
+def clean_text(value, max_len=None):
+    try:
+        if value is None:
+            value = ""
+        value = str(value).strip()
+        value = value.replace("\x00", "")
+        value = value.replace("\n", " ").replace("\r", " ")
+        value = " ".join(value.split())
+        if max_len and len(value) > max_len:
+            return value[:max_len]
+        return value
+    except Exception:
+        return ""
 
 
-# --------------------------------
-# SAFE GET
-# --------------------------------
-def safe_get(url, params=None):
-    for i in range(MAX_RETRIES):
-        try:
-            res = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
-            if res.status_code == 200:
-                return res
-
-            log(f"⚠ HTTP {res.status_code} → {url}")
-
-            try:
-                log(f"⚠ Response → {res.text}")
-            except:
-                pass
-
-        except Exception as e:
-            log(f"⚠ Retry {i+1}/{MAX_RETRIES} → {e}")
-
-        time.sleep(2 + i)
-
-    return None
-
-
-# --------------------------------
-# DATE FORMAT
-# --------------------------------
 def format_date(meta_date):
     try:
         dt = datetime.strptime(meta_date, "%Y-%m-%dT%H:%M:%S%z")
         return dt.strftime("%Y-%m-%d %H:%M:%S")
     except Exception:
-        return ""
+        return None
 
 
-# --------------------------------
-# EXTRACT FIELDS
-# --------------------------------
 def extract(meta):
     fields = {}
 
     for f in meta.get("field_data", []):
-        name = f.get("name", "").replace("?", "").lower().strip()
+        name = clean_text(f.get("name", "")).replace("?", "").lower()
         values = f.get("values", [])
         value = values[0] if values else ""
-        fields[name] = value
+        fields[name] = clean_text(value)
 
     return fields
 
 
-# --------------------------------
-# ESCAPE SQL
-# --------------------------------
-def esc(v):
-    return str(v).replace("'", "''") if v is not None else ""
+# =========================================================
+# SAFE HTTP
+# =========================================================
+def safe_get(url, params=None):
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            res = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
+
+            if res.status_code == 200:
+                return res
+
+            log(f"⚠ Meta GET failed [{res.status_code}] (try {attempt}/{MAX_RETRIES})")
+
+        except Exception as e:
+            log(f"⚠ Meta GET retry {attempt}/{MAX_RETRIES}: {e}")
+
+        time.sleep(2 + attempt)
+
+    return None
 
 
-# --------------------------------
-# LOAD ALL PAGES
-# --------------------------------
+def safe_post(url, data=None):
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            res = requests.post(url, data=data, timeout=REQUEST_TIMEOUT)
+
+            if res.status_code in [200, 201]:
+                return res
+
+            log(f"⚠ Meta POST failed [{res.status_code}] (try {attempt}/{MAX_RETRIES})")
+
+        except Exception as e:
+            log(f"⚠ Meta POST retry {attempt}/{MAX_RETRIES}: {e}")
+
+        time.sleep(2 + attempt)
+
+    return None
+
+
+# =========================================================
+# LOAD PAGES
+# =========================================================
 def load_pages(force=False):
-    global PAGE_TOKENS, LAST_PAGE_REFRESH
+    global PAGE_TOKENS, PAGE_NAMES, LAST_PAGE_REFRESH
 
     if not force and PAGE_TOKENS and (time.time() - LAST_PAGE_REFRESH < 600):
         return
 
-    log("🔄 Loading pages...")
+    if not USER_ACCESS_TOKEN:
+        log_error("❌ USER_ACCESS_TOKEN missing")
+        return
+
+    log("🔄 Loading Meta pages...")
+
     PAGE_TOKENS = {}
+    PAGE_NAMES = {}
 
     url = "https://graph.facebook.com/v25.0/me/accounts"
     params = {"access_token": USER_ACCESS_TOKEN, "limit": 100}
@@ -123,33 +194,76 @@ def load_pages(force=False):
     while url:
         res = safe_get(url, params=params)
         if not res:
-            log("❌ Failed to load pages")
+            log_error("❌ Failed to load pages")
             break
 
         data = res.json()
 
         if "error" in data:
-            log(f"❌ Page load error → {data}")
+            log_error(f"❌ Page load error: {data}")
             break
 
         for page in data.get("data", []):
-            pid = page.get("id")
-            ptoken = page.get("access_token")
+            pid = clean_text(page.get("id"))
+            ptoken = clean_text(page.get("access_token"))
+            pname = clean_text(page.get("name"))
 
             if pid and ptoken:
                 PAGE_TOKENS[pid] = ptoken
-                log(f"✅ {page.get('name','Unknown')} ({pid})")
+                PAGE_NAMES[pid] = pname
+                log(f"✅ Page: {pname}")
 
         url = data.get("paging", {}).get("next")
         params = None
 
     LAST_PAGE_REFRESH = time.time()
-    log(f"🔥 Total Pages → {len(PAGE_TOKENS)}")
+    log(f"📄 Total Pages Loaded: {len(PAGE_TOKENS)}")
 
 
-# --------------------------------
-# GET FORMS
-# --------------------------------
+# =========================================================
+# SUBSCRIBE ALL PAGES
+# =========================================================
+def subscribe_all_pages():
+    if not PAGE_TOKENS:
+        return
+
+    log("🔔 Ensuring pages are subscribed...")
+
+    for page_id, token in PAGE_TOKENS.items():
+        try:
+            url = f"https://graph.facebook.com/v25.0/{page_id}/subscribed_apps"
+            data = {
+                "subscribed_fields": "leadgen,leadgen_update",
+                "access_token": token
+            }
+
+            res = safe_post(url, data=data)
+            if res:
+                log(f"✅ Webhook subscribed: {PAGE_NAMES.get(page_id, page_id)}")
+            else:
+                log(f"⚠ Subscribe failed: {PAGE_NAMES.get(page_id, page_id)}")
+
+        except Exception as e:
+            log_error(f"❌ Subscribe error ({page_id}): {e}")
+
+
+# =========================================================
+# TOKEN HELPERS
+# =========================================================
+def get_page_token(page_id):
+    token = PAGE_TOKENS.get(str(page_id))
+    if token:
+        return token
+
+    log(f"⚠ Missing page token. Refreshing pages for page_id={page_id}")
+    load_pages(force=True)
+    subscribe_all_pages()
+    return PAGE_TOKENS.get(str(page_id), "")
+
+
+# =========================================================
+# FORMS
+# =========================================================
 def get_forms(page_id, token):
     forms = []
 
@@ -164,20 +278,16 @@ def get_forms(page_id, token):
         data = res.json()
 
         if "error" in data:
-            log(f"❌ Forms error → Page {page_id} → {data}")
+            log_error(f"❌ Forms fetch error for page {page_id}")
             break
 
         forms.extend(data.get("data", []))
-
         url = data.get("paging", {}).get("next")
         params = None
 
     return forms
 
 
-# --------------------------------
-# FORM NAME CACHE
-# --------------------------------
 def get_form_name(form_id, token):
     if not form_id:
         return ""
@@ -194,14 +304,14 @@ def get_form_name(form_id, token):
         return ""
 
     data = res.json()
-    name = data.get("name", "")
+    name = clean_text(data.get("name", ""), MAX_FORM_NAME)
     FORM_NAME_CACHE[form_id] = name
     return name
 
 
-# --------------------------------
+# =========================================================
 # FETCH LEAD
-# --------------------------------
+# =========================================================
 def fetch_lead(lead_id, token):
     res = safe_get(
         f"https://graph.facebook.com/v25.0/{lead_id}",
@@ -230,72 +340,43 @@ def fetch_lead(lead_id, token):
     data = res.json()
 
     if "error" in data:
-        log(f"❌ Lead fetch error → {lead_id} → {data}")
+        log_error(f"❌ Lead fetch failed: {lead_id}")
         return None
 
     return data
 
 
-# --------------------------------
-# GET EXISTING LEAD IDS
-# --------------------------------
+# =========================================================
+# DUPLICATE CHECK
+# =========================================================
 def get_existing_lead_ids(lead_ids):
     if not lead_ids:
         return set()
 
-    db = Database()
-    ids_sql = ",".join([f"'{esc(i)}'" for i in lead_ids])
+    try:
+        db = Database()
+        placeholders = ",".join(["?"] * len(lead_ids))
 
-    sql = f"""
-    SELECT LEAD_ID
-    FROM dbo.LEADS
-    WHERE LEAD_ID IN ({ids_sql})
-    """
+        sql = f"""
+        SELECT LEAD_ID
+        FROM dbo.LEADS
+        WHERE LEAD_ID IN ({placeholders})
+        """
 
-    status, rows = db.db_query(sql)
+        status, rows = db.db_query(sql, lead_ids)
 
-    if not status or not rows:
+        if not status or not rows:
+            return set()
+
+        return {str(r[0]) for r in rows}
+    except Exception as e:
+        log_error(f"❌ Duplicate check failed: {e}")
         return set()
 
-    return {str(r[0]) for r in rows}
 
-
-# --------------------------------
-# SAVE CHECKPOINT
-# --------------------------------
-def save_checkpoint(form_id, cursor):
-    db = Database()
-    cursor = esc(cursor)
-
-    sql = f"""
-    MERGE LEAD_CHECKPOINT AS target
-    USING (SELECT '{esc(form_id)}' AS FORM_ID) AS source
-    ON target.FORM_ID = source.FORM_ID
-    WHEN MATCHED THEN
-        UPDATE SET CURSOR = '{cursor}', UPDATED_AT = GETDATE()
-    WHEN NOT MATCHED THEN
-        INSERT (FORM_ID, CURSOR, UPDATED_AT)
-        VALUES ('{esc(form_id)}', '{cursor}', GETDATE());
-    """
-
-    db.db_update(sql)
-
-
-def get_checkpoint(form_id):
-    db = Database()
-
-    sql = f"SELECT CURSOR FROM LEAD_CHECKPOINT WHERE FORM_ID='{esc(form_id)}'"
-    status, rows = db.db_query(sql)
-
-    if status and rows:
-        return rows[0][0]
-
-    return None
-
-
-# --------------------------------
+# =========================================================
 # BULK INSERT
-# --------------------------------
+# =========================================================
 def bulk_insert(leads):
     if not leads:
         return
@@ -304,102 +385,119 @@ def bulk_insert(leads):
     if not leads:
         return
 
+    # remove duplicate lead IDs in same batch
     unique_map = {}
     for meta in leads:
         unique_map[meta["id"]] = meta
-
     leads = list(unique_map.values())
 
     existing = get_existing_lead_ids([x["id"] for x in leads])
     leads = [x for x in leads if x["id"] not in existing]
 
     if not leads:
-        log("⏭ No new leads to insert")
+        log("⏭ No new leads")
         return
 
     db = Database()
-    values = []
+    rows = []
 
     for meta in leads:
-        fields = extract(meta)
+        try:
+            fields = extract(meta)
 
-        travel_date = (
-            fields.get("preferred_travel_date")
-            or fields.get("preffered_travel_date")
-            or fields.get("preferred_travel_month_or_date")
-            or ""
-        )
+            travel_date = (
+                fields.get("preferred_travel_date")
+                or fields.get("preffered_travel_date")
+                or fields.get("preferred_travel_month_or_date")
+                or fields.get("month")
+                or ""
+            )
 
-        phone = fields.get("phone_number") or fields.get("whatsapp_number") or ""
+            phone = (
+                fields.get("phone_number")
+                or fields.get("whatsapp_number")
+                or fields.get("mobile_number")
+                or ""
+            )
 
-        form_id = esc(meta.get("form_id", ""))
-        page_id = meta.get("_page_id", "")
-        token = PAGE_TOKENS.get(page_id, "")
-        form_name = esc(get_form_name(form_id, token))
+            form_id = clean_text(meta.get("form_id"))
+            page_id = clean_text(meta.get("_page_id"))
+            token = PAGE_TOKENS.get(page_id, "")
+            form_name = get_form_name(form_id, token)
 
-        values.append(f"""
-        (
-            '{esc(meta.get("id"))}',
-            '{esc(format_date(meta.get("created_time")))}',
-            '{esc(meta.get("ad_id",""))}',
-            '{esc(meta.get("ad_name",""))}',
-            '{esc(meta.get("adset_id",""))}',
-            '{esc(meta.get("adset_name",""))}',
-            '{esc(meta.get("campaign_id",""))}',
-            '{esc(meta.get("campaign_name",""))}',
-            '{form_id}',
-            '{form_name}',
-            '{esc(meta.get("is_organic",""))}',
-            '{esc(meta.get("platform",""))}',
-            '{esc(fields.get("full_name",""))}',
-            '{esc(phone)}',
-            '{esc(fields.get("email",""))}',
-            '{esc(fields.get("city",""))}',
-            '{esc(travel_date)}',
-            '{esc(fields.get("preferred_mode_of_contact",""))}',
-            '{esc(fields.get("how_many_people_are_travelling_with",""))}',
-            '{esc(json.dumps(meta))}',
-            GETDATE(),
-            GETDATE()
-        )
-        """)
+            is_organic = 1 if str(meta.get("is_organic", "")).lower() in ["true", "1"] else 0
 
-    sql = f"""
+            row = (
+                clean_text(meta.get("id")),
+                format_date(meta.get("created_time")),
+                clean_text(meta.get("ad_id")),
+                clean_text(meta.get("ad_name"), MAX_AD_NAME),
+                clean_text(meta.get("adset_id")),
+                clean_text(meta.get("adset_name"), MAX_ADSET_NAME),
+                clean_text(meta.get("campaign_id")),
+                clean_text(meta.get("campaign_name"), MAX_CAMPAIGN_NAME),
+                form_id,
+                clean_text(form_name, MAX_FORM_NAME),
+                is_organic,
+                clean_text(meta.get("platform"), MAX_PLATFORM),
+                clean_text(fields.get("full_name"), MAX_NAME),
+                clean_text(phone, MAX_PHONE),
+                clean_text(fields.get("email"), MAX_EMAIL),
+                clean_text(fields.get("city"), MAX_CITY),
+                clean_text(travel_date, MAX_TRAVEL_DATE),
+                clean_text(fields.get("preferred_mode_of_contact"), MAX_CONTACT_MODE),
+                clean_text(fields.get("how_many_people_are_travelling_with"), MAX_TRAVELLERS),
+                json.dumps(meta, ensure_ascii=False),
+            )
+
+            rows.append(row)
+
+        except Exception as e:
+            log_error(f"❌ Row build failed for lead {meta.get('id')}: {e}")
+
+    if not rows:
+        log("⚠ No valid rows to insert")
+        return
+
+    sql = """
     INSERT INTO dbo.LEADS (
         LEAD_ID, CREATED_TIME, AD_ID, AD_NAME, ADSET_ID, ADSET_NAME,
         CAMPAIGN_ID, CAMPAIGN_NAME, FORM_ID, FORM_NAME,
         IS_ORGANIC, PLATFORM, FULL_NAME, PHONE_NUMBER, EMAIL, CITY,
         PREFERRED_TRAVEL_DATE, PREFERRED_MODE_OF_CONTACT,
         HOW_MANY_PEOPLE_ARE_TRAVELLING_WITH,
-        RAW_LEAD_JSON, CREATED_DATE, MODIFIED_DATE
+        RAW_LEAD_JSON
     )
-    VALUES {",".join(values)}
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """
 
-    status, result = db.db_update(sql)
+    try:
+        status, result = db.db_executemany(sql, rows)
 
-    if status:
-        log(f"💾 Bulk Insert → {len(leads)} leads")
-    else:
-        log(f"❌ Bulk insert failed → {result}")
+        if status:
+            log(f"💾 Saved {len(rows)} lead(s)")
+        else:
+            log_error(f"❌ DB insert failed: {result}")
+
+    except Exception as e:
+        log_error(f"❌ Bulk insert exception: {e}")
 
 
-# --------------------------------
-# DIRECT SAVE (FOR WEBHOOK)
-# --------------------------------
+# =========================================================
+# DIRECT SAVE (WEBHOOK FIRST PRIORITY)
+# =========================================================
 def save_lead_direct(meta):
     if not meta:
         return
-
     try:
         bulk_insert([meta])
     except Exception as e:
-        log(f"❌ Direct save error → {e}")
+        log_error(f"❌ Direct save failed: {e}")
 
 
-# --------------------------------
-# BUFFER
-# --------------------------------
+# =========================================================
+# BUFFER / BATCH
+# =========================================================
 def add_to_buffer(meta):
     if not meta:
         return
@@ -426,7 +524,7 @@ def buffer_flusher():
         try:
             flush_buffer()
         except Exception as e:
-            log(f"❌ Buffer flusher error → {e}")
+            log_error(f"❌ Buffer flush error: {e}")
         time.sleep(BUFFER_FLUSH_SECONDS)
 
 
@@ -438,27 +536,22 @@ def start_buffer_flusher():
 
     threading.Thread(target=buffer_flusher, daemon=True).start()
     FLUSHER_STARTED = True
-    log(f"🧼 Buffer flusher started → every {BUFFER_FLUSH_SECONDS}s")
+    log(f"🧼 Buffer auto-save every {BUFFER_FLUSH_SECONDS}s")
 
 
-# --------------------------------
-# PROCESS LEAD
-# --------------------------------
+# =========================================================
+# WORKER PROCESSING
+# =========================================================
 def process_lead_job(job):
     lead_id = job.get("lead_id")
-    page_id = job.get("page_id")
+    page_id = clean_text(job.get("page_id"))
 
     if not lead_id or not page_id:
         return
 
-    token = PAGE_TOKENS.get(page_id)
+    token = get_page_token(page_id)
     if not token:
-        log(f"⚠ Missing page token → {page_id}")
-        load_pages(force=True)
-        token = PAGE_TOKENS.get(page_id)
-
-    if not token:
-        log(f"❌ No page token found → {page_id}")
+        log_error(f"❌ No page token for page {page_id}")
         return
 
     meta = fetch_lead(lead_id, token)
@@ -469,53 +562,49 @@ def process_lead_job(job):
     add_to_buffer(meta)
 
 
-# --------------------------------
-# PROCESS LEAD DIRECT FOR WEBHOOK
-# --------------------------------
 def process_webhook_lead(lead_id, page_id):
     try:
-        token = PAGE_TOKENS.get(page_id)
+        page_id = clean_text(page_id)
+        token = get_page_token(page_id)
 
         if not token:
-            load_pages(force=True)
-            token = PAGE_TOKENS.get(page_id)
-
-        if not token:
-            log(f"❌ Webhook token missing → {page_id}")
+            log_error(f"❌ Webhook token missing for page {page_id}")
             return
 
         meta = fetch_lead(lead_id, token)
         if not meta:
+            log_error(f"❌ Webhook fetch failed for lead {lead_id}")
             return
 
         meta["_page_id"] = page_id
-
-        # 🔥 DIRECT SAVE (like old code)
         save_lead_direct(meta)
 
-        log(f"⚡ Instant webhook lead saved → {lead_id}")
+        log(f"⚡ Webhook saved instantly: {lead_id}")
 
     except Exception as e:
-        log(f"❌ Webhook lead process error → {e}")
+        log_error(f"❌ Webhook processing failed: {e}")
 
 
-# --------------------------------
-# WORKER LOOP
-# --------------------------------
+# =========================================================
+# WORKERS
+# =========================================================
 def worker_loop():
     while True:
+        job = None
         try:
             job = LEAD_QUEUE.get()
 
             if job is None:
-                break
+                continue
 
             process_lead_job(job)
 
         except Exception as e:
-            log(f"❌ Worker error → {e}")
+            log_error(f"❌ Worker failed: {e}")
+
         finally:
-            LEAD_QUEUE.task_done()
+            if job is not None:
+                LEAD_QUEUE.task_done()
 
 
 def start_workers():
@@ -529,96 +618,97 @@ def start_workers():
         t.start()
 
     WORKERS_STARTED = True
-    log(f"👷 Workers started → {WORKER_COUNT}")
+    log(f"👷 Workers started: {WORKER_COUNT}")
 
 
-# --------------------------------
+# =========================================================
 # INIT ENGINE
-# --------------------------------
+# =========================================================
 def init_engine():
     log("🚀 Initializing CRM Engine...")
     load_pages(force=True)
+    subscribe_all_pages()
     start_workers()
     start_buffer_flusher()
+    log("✅ CRM Engine ready")
 
 
-# --------------------------------
-# IMPORT ALL HISTORICAL
-# --------------------------------
+# =========================================================
+# HISTORICAL IMPORT
+# =========================================================
 def import_all():
     global IMPORT_DONE
 
-    log("🚀 HISTORICAL IMPORT START")
-    load_pages(force=True)
+    try:
+        log("📥 Historical import started")
 
-    for page_id, token in PAGE_TOKENS.items():
-        log(f"📘 Page → {page_id}")
+        load_pages(force=True)
+        subscribe_all_pages()
 
-        forms = get_forms(page_id, token)
-        log(f"🧾 Forms → {len(forms)}")
+        for page_id, token in PAGE_TOKENS.items():
+            page_name = PAGE_NAMES.get(page_id, "Unknown")
+            log(f"📘 Page: {page_name}")
 
-        for form in forms:
-            form_id = form.get("id")
-            if not form_id:
-                continue
+            forms = get_forms(page_id, token)
+            log(f"🧾 Forms found: {len(forms)}")
 
-            log(f"🚀 Fetch form → {form_id}")
+            for form in forms:
+                form_id = form.get("id")
+                if not form_id:
+                    continue
 
-            url = get_checkpoint(form_id)
-            if not url:
+                log(f"📄 Importing form: {form_id}")
+
                 url = f"https://graph.facebook.com/v25.0/{form_id}/leads"
+                params = {"access_token": token, "limit": 100}
 
-            params = {"access_token": token, "limit": 100}
+                while url:
+                    res = safe_get(url, params=params)
+                    if not res:
+                        break
 
-            while url:
-                res = safe_get(url, params=params)
-                if not res:
-                    break
+                    data = res.json()
 
-                data = res.json()
+                    if "error" in data:
+                        log_error(f"❌ Leads fetch failed for form {form_id}")
+                        break
 
-                if "error" in data:
-                    log(f"❌ Leads fetch error → Form {form_id} → {data}")
-                    break
+                    leads = data.get("data", [])
+                    if leads:
+                        log(f"📦 Batch: {len(leads)}")
 
-                leads = data.get("data", [])
-                log(f"📦 Batch → {len(leads)}")
+                    for lead in leads:
+                        lead_id = lead.get("id")
+                        if lead_id:
+                            LEAD_QUEUE.put({"lead_id": lead_id, "page_id": page_id})
 
-                for lead in leads:
-                    lead_id = lead.get("id")
-                    if lead_id:
-                        LEAD_QUEUE.put({"lead_id": lead_id, "page_id": page_id})
+                    url = data.get("paging", {}).get("next")
+                    params = None
 
-                next_url = data.get("paging", {}).get("next")
+        LEAD_QUEUE.join()
+        flush_buffer()
 
-                if next_url:
-                    save_checkpoint(form_id, next_url)
+        IMPORT_DONE = True
+        log("✅ Historical import completed")
 
-                url = next_url
-                params = None
-
-    LEAD_QUEUE.join()
-    flush_buffer()
-
-    IMPORT_DONE = True
-    log("✅ HISTORICAL IMPORT DONE")
+    except Exception as e:
+        log_error(f"❌ Historical import failed: {e}")
 
 
-# --------------------------------
-# POLLING
-# --------------------------------
+# =========================================================
+# POLLING BACKUP
+# =========================================================
 def poll():
     while True:
-        if not IMPORT_DONE:
-            log("⏳ Waiting for historical import to finish before polling...")
-            time.sleep(30)
-            continue
-
-        log("🔄 Polling backup running...")
-
         try:
-            if not PAGE_TOKENS:
-                load_pages(force=True)
+            if not IMPORT_DONE:
+                log("⏳ Waiting for historical import...")
+                time.sleep(30)
+                continue
+
+            log("🔄 Polling backup check...")
+
+            load_pages(force=True)
 
             for page_id, token in PAGE_TOKENS.items():
                 forms = get_forms(page_id, token)
@@ -647,48 +737,92 @@ def poll():
             flush_buffer()
 
         except Exception as e:
-            log(f"❌ Poll error → {e}")
+            log_error(f"❌ Polling error: {e}")
 
         time.sleep(POLL_INTERVAL_SECONDS)
 
 
 def start_polling():
+    global POLLING_STARTED
+
+    if POLLING_STARTED:
+        return
+
     thread = threading.Thread(target=poll, daemon=True)
     thread.start()
+    POLLING_STARTED = True
 
 
-# --------------------------------
-# WEBHOOK VERIFY
-# --------------------------------
-@router.get("/webhook")
+# =========================================================
+# HEALTH / DEBUG
+# =========================================================
+@router.get("/api/health/crm")
+def crm_health():
+    return {
+        "status": "ok",
+        "pages_loaded": len(PAGE_TOKENS),
+        "workers_started": WORKERS_STARTED,
+        "import_done": IMPORT_DONE,
+        "buffer_size": len(INSERT_BUFFER),
+        "queue_size": LEAD_QUEUE.qsize()
+    }
+
+
+@router.post("/api/test-webhook")
+async def test_webhook():
+    log("🔥 Test webhook hit")
+    return {"status": "ok"}
+
+
+@router.post("/api/post-check")
+async def post_check(request: Request):
+    try:
+        raw_body = await request.body()
+        log(f"🧪 POST check received")
+        return {"status": "ok", "size": len(raw_body)}
+    except Exception as e:
+        log_error(f"❌ POST check failed: {e}")
+        return {"status": "error"}
+
+
+# =========================================================
+# META WEBHOOK VERIFY
+# =========================================================
+@router.get("/api/switrus_engine")
 async def verify(request: Request):
     mode = request.query_params.get("hub.mode")
     verify_token = request.query_params.get("hub.verify_token")
     challenge = request.query_params.get("hub.challenge")
 
-    log(f"🔐 Webhook verify request → mode={mode} token={verify_token}")
-
     if mode == "subscribe" and verify_token == VERIFY_TOKEN:
-        log("✅ Webhook verified successfully")
-        return int(challenge)
+        log("✅ Webhook verified")
+        return PlainTextResponse(content=challenge or "", status_code=200)
 
-    log("❌ Webhook verification failed")
-    return {"error": "Verification failed"}
+    log_error("❌ Webhook verification failed")
+    return JSONResponse(content={"error": "Verification failed"}, status_code=403)
 
 
-# --------------------------------
-# WEBHOOK RECEIVE
-# --------------------------------
-@router.post("/webhook")
+# =========================================================
+# META WEBHOOK RECEIVE
+# =========================================================
+@router.post("/api/switrus_engine")
 async def webhook(request: Request):
     try:
-        body = await request.json()
-        log(f"🔥 WEBHOOK RECEIVED → {json.dumps(body)}")
+        raw_body = await request.body()
+
+        try:
+            body = json.loads(raw_body.decode("utf-8"))
+        except Exception as e:
+            log_error(f"❌ Invalid webhook JSON: {e}")
+            return {"status": "bad_json"}
+
+        events_found = 0
 
         for entry in body.get("entry", []):
             for change in entry.get("changes", []):
+                field_name = change.get("field")
 
-                if change.get("field") != "leadgen":
+                if field_name not in ["leadgen", "leadgen_update"]:
                     continue
 
                 val = change.get("value", {})
@@ -696,16 +830,23 @@ async def webhook(request: Request):
                 page_id = val.get("page_id")
 
                 if lead_id and page_id:
-                    thread = threading.Thread(
+                    events_found += 1
+
+                    # WEBHOOK = FIRST PRIORITY = INSTANT SAVE
+                    threading.Thread(
                         target=process_webhook_lead,
                         args=(lead_id, page_id),
                         daemon=True
-                    )
-                    thread.start()
+                    ).start()
 
-                    log(f"📥 Instant webhook processing → {lead_id}")
+                    log(f"⚡ New webhook lead: {lead_id}")
+
+        if events_found == 0:
+            log("ℹ Webhook received but no lead events found")
+        else:
+            log(f"📥 Webhook processed {events_found} lead event(s)")
 
     except Exception as e:
-        log(f"❌ Webhook error → {e}")
+        log_error(f"❌ Webhook handler failed: {e}")
 
     return {"status": "ok"}

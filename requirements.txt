@@ -1,5 +1,6 @@
 fastapi
 uvicorn
-python-dotenv
 requests
-pymssql
+python-dotenv
+pyodbc
+gunicorn
