@@ -7,6 +7,7 @@ import logging
 import requests
 
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from fastapi import APIRouter, Request
 from fastapi.responses import PlainTextResponse, JSONResponse
 from dotenv import load_dotenv
@@ -20,7 +21,7 @@ load_dotenv()
 # =========================================================
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 logger = logging.getLogger("crm")
 
@@ -57,12 +58,17 @@ if not USER_ACCESS_TOKEN:
 # =========================================================
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "50"))
 WORKER_COUNT = int(os.getenv("WORKER_COUNT", "4"))
-REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "40"))
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "15"))
 POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "600"))
-MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
+MAX_RETRIES = int(os.getenv("MAX_RETRIES", "2"))
 BUFFER_FLUSH_SECONDS = int(os.getenv("BUFFER_FLUSH_SECONDS", "10"))
 
-# DB SAFE LENGTHS (adjust if needed)
+# 🔥 Parallel speed settings
+PAGE_FETCH_THREADS = int(os.getenv("PAGE_FETCH_THREADS", "10"))
+FORM_FETCH_THREADS = int(os.getenv("FORM_FETCH_THREADS", "20"))
+LEAD_FETCH_THREADS = int(os.getenv("LEAD_FETCH_THREADS", "30"))
+
+# DB SAFE LENGTHS
 MAX_FORM_NAME = 255
 MAX_NAME = 255
 MAX_PHONE = 50
@@ -83,9 +89,13 @@ MAX_CAMPAIGN_NAME = 255
 PAGE_TOKENS = {}
 PAGE_NAMES = {}
 FORM_NAME_CACHE = {}
-LEAD_QUEUE = queue.Queue(maxsize=50000)
+
+LEAD_QUEUE = queue.Queue(maxsize=50000)       # backup import/poll queue
+WEBHOOK_QUEUE = queue.Queue(maxsize=50000)    # 🔥 first priority webhook queue
+
 INSERT_BUFFER = []
 BUFFER_LOCK = threading.Lock()
+
 WORKERS_STARTED = False
 IMPORT_DONE = False
 LAST_PAGE_REFRESH = 0
@@ -121,13 +131,11 @@ def format_date(meta_date):
 
 def extract(meta):
     fields = {}
-
     for f in meta.get("field_data", []):
         name = clean_text(f.get("name", "")).replace("?", "").lower()
         values = f.get("values", [])
         value = values[0] if values else ""
         fields[name] = clean_text(value)
-
     return fields
 
 
@@ -138,17 +146,12 @@ def safe_get(url, params=None):
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             res = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
-
             if res.status_code == 200:
                 return res
-
             log(f"⚠ Meta GET failed [{res.status_code}] (try {attempt}/{MAX_RETRIES})")
-
         except Exception as e:
             log(f"⚠ Meta GET retry {attempt}/{MAX_RETRIES}: {e}")
-
-        time.sleep(2 + attempt)
-
+        time.sleep(1)
     return None
 
 
@@ -156,17 +159,12 @@ def safe_post(url, data=None):
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             res = requests.post(url, data=data, timeout=REQUEST_TIMEOUT)
-
             if res.status_code in [200, 201]:
                 return res
-
             log(f"⚠ Meta POST failed [{res.status_code}] (try {attempt}/{MAX_RETRIES})")
-
         except Exception as e:
             log(f"⚠ Meta POST retry {attempt}/{MAX_RETRIES}: {e}")
-
-        time.sleep(2 + attempt)
-
+        time.sleep(1)
     return None
 
 
@@ -211,13 +209,13 @@ def load_pages(force=False):
             if pid and ptoken:
                 PAGE_TOKENS[pid] = ptoken
                 PAGE_NAMES[pid] = pname
-                log(f"✅ Page: {pname}")
+                log(f"📘 Page Loaded → {pname}")
 
         url = data.get("paging", {}).get("next")
         params = None
 
     LAST_PAGE_REFRESH = time.time()
-    log(f"📄 Total Pages Loaded: {len(PAGE_TOKENS)}")
+    log(f"✅ Meta Pages Ready → {len(PAGE_TOKENS)} page(s)")
 
 
 # =========================================================
@@ -239,12 +237,12 @@ def subscribe_all_pages():
 
             res = safe_post(url, data=data)
             if res:
-                log(f"✅ Webhook subscribed: {PAGE_NAMES.get(page_id, page_id)}")
+                log(f"✅ Webhook subscribed → {PAGE_NAMES.get(page_id, page_id)}")
             else:
-                log(f"⚠ Subscribe failed: {PAGE_NAMES.get(page_id, page_id)}")
+                log(f"⚠ Subscribe failed → {PAGE_NAMES.get(page_id, page_id)}")
 
         except Exception as e:
-            log_error(f"❌ Subscribe error ({page_id}): {e}")
+            log_error(f"❌ Subscribe error ({page_id}) → {e}")
 
 
 # =========================================================
@@ -255,7 +253,6 @@ def get_page_token(page_id):
     if token:
         return token
 
-    log(f"⚠ Missing page token. Refreshing pages for page_id={page_id}")
     load_pages(force=True)
     subscribe_all_pages()
     return PAGE_TOKENS.get(str(page_id), "")
@@ -266,7 +263,6 @@ def get_page_token(page_id):
 # =========================================================
 def get_forms(page_id, token):
     forms = []
-
     url = f"https://graph.facebook.com/v25.0/{page_id}/leadgen_forms"
     params = {"access_token": token, "limit": 100}
 
@@ -288,6 +284,21 @@ def get_forms(page_id, token):
     return forms
 
 
+def fetch_forms_for_page(page_id, token):
+    try:
+        forms = get_forms(page_id, token)
+        return {
+            "page_id": page_id,
+            "forms": forms
+        }
+    except Exception as e:
+        log_error(f"❌ fetch_forms_for_page failed → {page_id} | {e}")
+        return {
+            "page_id": page_id,
+            "forms": []
+        }
+
+
 def get_form_name(form_id, token):
     if not form_id:
         return ""
@@ -307,6 +318,62 @@ def get_form_name(form_id, token):
     name = clean_text(data.get("name", ""), MAX_FORM_NAME)
     FORM_NAME_CACHE[form_id] = name
     return name
+
+
+def get_form_leads_page(form_id, token, limit=100):
+    """
+    Fetch latest leads for one form (single page request only for speed).
+    Used in polling.
+    """
+    try:
+        res = safe_get(
+            f"https://graph.facebook.com/v25.0/{form_id}/leads",
+            params={"access_token": token, "limit": limit}
+        )
+
+        if not res:
+            return []
+
+        data = res.json()
+        if "error" in data:
+            log_error(f"❌ Lead list fetch failed for form {form_id} → {data}")
+            return []
+
+        return data.get("data", [])
+
+    except Exception as e:
+        log_error(f"❌ get_form_leads_page failed → {form_id} | {e}")
+        return []
+
+
+def get_all_form_leads_full(form_id, token):
+    """
+    Full historical lead fetch for one form.
+    Used in historical import.
+    """
+    all_leads = []
+    try:
+        url = f"https://graph.facebook.com/v25.0/{form_id}/leads"
+        params = {"access_token": token, "limit": 100}
+
+        while url:
+            res = safe_get(url, params=params)
+            if not res:
+                break
+
+            data = res.json()
+            if "error" in data:
+                log_error(f"❌ Full lead fetch failed for form {form_id} → {data}")
+                break
+
+            all_leads.extend(data.get("data", []))
+            url = data.get("paging", {}).get("next")
+            params = None
+
+    except Exception as e:
+        log_error(f"❌ get_all_form_leads_full failed → {form_id} | {e}")
+
+    return all_leads
 
 
 # =========================================================
@@ -340,42 +407,100 @@ def fetch_lead(lead_id, token):
     data = res.json()
 
     if "error" in data:
-        log_error(f"❌ Lead fetch failed: {lead_id}")
+        log_error(f"❌ Lead fetch failed → {lead_id} | {data}")
         return None
 
     return data
 
 
 # =========================================================
-# DUPLICATE CHECK
+# VERY FAST SINGLE INSERT (WEBHOOK FIRST)
 # =========================================================
-def get_existing_lead_ids(lead_ids):
-    if not lead_ids:
-        return set()
-
+def insert_one_lead_fast(meta):
     try:
-        db = Database()
-        placeholders = ",".join(["?"] * len(lead_ids))
+        if not meta or not meta.get("id"):
+            return False
 
-        sql = f"""
-        SELECT LEAD_ID
-        FROM dbo.LEADS
-        WHERE LEAD_ID IN ({placeholders})
+        db = Database()
+        fields = extract(meta)
+
+        travel_date = (
+            fields.get("preferred_travel_date")
+            or fields.get("preffered_travel_date")
+            or fields.get("preferred_travel_month_or_date")
+            or fields.get("month")
+            or ""
+        )
+
+        phone = (
+            fields.get("phone_number")
+            or fields.get("whatsapp_number")
+            or fields.get("mobile_number")
+            or ""
+        )
+
+        form_id = clean_text(meta.get("form_id"))
+        page_id = clean_text(meta.get("_page_id"))
+        token = PAGE_TOKENS.get(page_id, "")
+        form_name = get_form_name(form_id, token)
+
+        is_organic = 1 if str(meta.get("is_organic", "")).lower() in ["true", "1"] else 0
+
+        sql = """
+        IF NOT EXISTS (SELECT 1 FROM dbo.LEADS WHERE LEAD_ID = ?)
+        BEGIN
+            INSERT INTO dbo.LEADS (
+                LEAD_ID, CREATED_TIME, AD_ID, AD_NAME, ADSET_ID, ADSET_NAME,
+                CAMPAIGN_ID, CAMPAIGN_NAME, FORM_ID, FORM_NAME,
+                IS_ORGANIC, PLATFORM, FULL_NAME, PHONE_NUMBER, EMAIL, CITY,
+                PREFERRED_TRAVEL_DATE, PREFERRED_MODE_OF_CONTACT,
+                HOW_MANY_PEOPLE_ARE_TRAVELLING_WITH,
+                RAW_LEAD_JSON
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        END
         """
 
-        status, rows = db.db_query(sql, lead_ids)
+        params = [
+            clean_text(meta.get("id")),
+            clean_text(meta.get("id")),
+            format_date(meta.get("created_time")),
+            clean_text(meta.get("ad_id")),
+            clean_text(meta.get("ad_name"), MAX_AD_NAME),
+            clean_text(meta.get("adset_id")),
+            clean_text(meta.get("adset_name"), MAX_ADSET_NAME),
+            clean_text(meta.get("campaign_id")),
+            clean_text(meta.get("campaign_name"), MAX_CAMPAIGN_NAME),
+            form_id,
+            clean_text(form_name, MAX_FORM_NAME),
+            is_organic,
+            clean_text(meta.get("platform"), MAX_PLATFORM),
+            clean_text(fields.get("full_name"), MAX_NAME),
+            clean_text(phone, MAX_PHONE),
+            clean_text(fields.get("email"), MAX_EMAIL),
+            clean_text(fields.get("city"), MAX_CITY),
+            clean_text(travel_date, MAX_TRAVEL_DATE),
+            clean_text(fields.get("preferred_mode_of_contact"), MAX_CONTACT_MODE),
+            clean_text(fields.get("how_many_people_are_travelling_with"), MAX_TRAVELLERS),
+            json.dumps(meta, ensure_ascii=False),
+        ]
 
-        if not status or not rows:
-            return set()
+        status, result = db.db_update(sql, params)
 
-        return {str(r[0]) for r in rows}
+        if status:
+            log(f"⚡ Lead inserted instantly → {meta.get('id')}")
+            return True
+
+        log_error(f"❌ Instant insert failed → {result}")
+        return False
+
     except Exception as e:
-        log_error(f"❌ Duplicate check failed: {e}")
-        return set()
+        log_error(f"❌ insert_one_lead_fast failed → {e}")
+        return False
 
 
 # =========================================================
-# BULK INSERT
+# BULK INSERT (BACKUP PATH)
 # =========================================================
 def bulk_insert(leads):
     if not leads:
@@ -383,19 +508,6 @@ def bulk_insert(leads):
 
     leads = [x for x in leads if x and x.get("id")]
     if not leads:
-        return
-
-    # remove duplicate lead IDs in same batch
-    unique_map = {}
-    for meta in leads:
-        unique_map[meta["id"]] = meta
-    leads = list(unique_map.values())
-
-    existing = get_existing_lead_ids([x["id"] for x in leads])
-    leads = [x for x in leads if x["id"] not in existing]
-
-    if not leads:
-        log("⏭ No new leads")
         return
 
     db = Database()
@@ -453,10 +565,9 @@ def bulk_insert(leads):
             rows.append(row)
 
         except Exception as e:
-            log_error(f"❌ Row build failed for lead {meta.get('id')}: {e}")
+            log_error(f"❌ Row build failed for lead {meta.get('id')} → {e}")
 
     if not rows:
-        log("⚠ No valid rows to insert")
         return
 
     sql = """
@@ -468,35 +579,28 @@ def bulk_insert(leads):
         HOW_MANY_PEOPLE_ARE_TRAVELLING_WITH,
         RAW_LEAD_JSON
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
+    WHERE NOT EXISTS (
+        SELECT 1 FROM dbo.LEADS WHERE LEAD_ID = ?
+    )
     """
 
-    try:
-        status, result = db.db_executemany(sql, rows)
+    fixed_rows = []
+    for r in rows:
+        fixed_rows.append(r + (r[0],))
 
+    try:
+        status, result = db.db_executemany(sql, fixed_rows)
         if status:
             log(f"💾 Saved {len(rows)} lead(s)")
         else:
-            log_error(f"❌ DB insert failed: {result}")
-
+            log_error(f"❌ DB insert failed → {result}")
     except Exception as e:
-        log_error(f"❌ Bulk insert exception: {e}")
+        log_error(f"❌ Bulk insert exception → {e}")
 
 
 # =========================================================
-# DIRECT SAVE (WEBHOOK FIRST PRIORITY)
-# =========================================================
-def save_lead_direct(meta):
-    if not meta:
-        return
-    try:
-        bulk_insert([meta])
-    except Exception as e:
-        log_error(f"❌ Direct save failed: {e}")
-
-
-# =========================================================
-# BUFFER / BATCH
+# BUFFER / BATCH (BACKUP ONLY)
 # =========================================================
 def add_to_buffer(meta):
     if not meta:
@@ -524,23 +628,21 @@ def buffer_flusher():
         try:
             flush_buffer()
         except Exception as e:
-            log_error(f"❌ Buffer flush error: {e}")
+            log_error(f"❌ Buffer flush error → {e}")
         time.sleep(BUFFER_FLUSH_SECONDS)
 
 
 def start_buffer_flusher():
     global FLUSHER_STARTED
-
     if FLUSHER_STARTED:
         return
-
     threading.Thread(target=buffer_flusher, daemon=True).start()
     FLUSHER_STARTED = True
     log(f"🧼 Buffer auto-save every {BUFFER_FLUSH_SECONDS}s")
 
 
 # =========================================================
-# WORKER PROCESSING
+# WORKER PROCESSING (BACKUP ONLY)
 # =========================================================
 def process_lead_job(job):
     lead_id = job.get("lead_id")
@@ -551,7 +653,6 @@ def process_lead_job(job):
 
     token = get_page_token(page_id)
     if not token:
-        log_error(f"❌ No page token for page {page_id}")
         return
 
     meta = fetch_lead(lead_id, token)
@@ -562,7 +663,11 @@ def process_lead_job(job):
     add_to_buffer(meta)
 
 
-def process_webhook_lead(lead_id, page_id):
+def process_webhook_lead_immediate(lead_id, page_id):
+    """
+    FASTEST PATH:
+    webhook queue → fetch → insert immediately
+    """
     try:
         page_id = clean_text(page_id)
         token = get_page_token(page_id)
@@ -577,12 +682,16 @@ def process_webhook_lead(lead_id, page_id):
             return
 
         meta["_page_id"] = page_id
-        save_lead_direct(meta)
 
-        log(f"⚡ Webhook saved instantly: {lead_id}")
+        ok = insert_one_lead_fast(meta)
+
+        if ok:
+            log(f"🚀 WEBHOOK FIRST PRIORITY SAVED → {lead_id}")
+        else:
+            log_error(f"❌ Webhook immediate save failed → {lead_id}")
 
     except Exception as e:
-        log_error(f"❌ Webhook processing failed: {e}")
+        log_error(f"❌ Webhook processing failed → {e}")
 
 
 # =========================================================
@@ -593,18 +702,35 @@ def worker_loop():
         job = None
         try:
             job = LEAD_QUEUE.get()
-
             if job is None:
                 continue
-
             process_lead_job(job)
-
         except Exception as e:
-            log_error(f"❌ Worker failed: {e}")
-
+            log_error(f"❌ Worker failed → {e}")
         finally:
             if job is not None:
                 LEAD_QUEUE.task_done()
+
+
+def webhook_worker_loop():
+    while True:
+        job = None
+        try:
+            job = WEBHOOK_QUEUE.get()
+            if not job:
+                continue
+
+            lead_id = job.get("lead_id")
+            page_id = job.get("page_id")
+
+            if lead_id and page_id:
+                process_webhook_lead_immediate(lead_id, page_id)
+
+        except Exception as e:
+            log_error(f"❌ Webhook worker failed → {e}")
+        finally:
+            if job is not None:
+                WEBHOOK_QUEUE.task_done()
 
 
 def start_workers():
@@ -613,12 +739,16 @@ def start_workers():
     if WORKERS_STARTED:
         return
 
+    # normal workers
     for _ in range(WORKER_COUNT):
         t = threading.Thread(target=worker_loop, daemon=True)
         t.start()
 
+    # 🔥 dedicated webhook priority worker
+    threading.Thread(target=webhook_worker_loop, daemon=True).start()
+
     WORKERS_STARTED = True
-    log(f"👷 Workers started: {WORKER_COUNT}")
+    log(f"👷 Workers started → {WORKER_COUNT} + 1 webhook priority worker")
 
 
 # =========================================================
@@ -634,101 +764,152 @@ def init_engine():
 
 
 # =========================================================
-# HISTORICAL IMPORT
+# HISTORICAL IMPORT (PARALLEL)
 # =========================================================
 def import_all():
     global IMPORT_DONE
 
     try:
-        log("📥 Historical import started")
+        log("📥 Historical import started (parallel mode)")
 
         load_pages(force=True)
         subscribe_all_pages()
 
-        for page_id, token in PAGE_TOKENS.items():
-            page_name = PAGE_NAMES.get(page_id, "Unknown")
-            log(f"📘 Page: {page_name}")
+        page_items = list(PAGE_TOKENS.items())
+        all_page_forms = []
 
-            forms = get_forms(page_id, token)
-            log(f"🧾 Forms found: {len(forms)}")
+        # -----------------------------------------
+        # STEP 1: Fetch all forms from all pages in parallel
+        # -----------------------------------------
+        with ThreadPoolExecutor(max_workers=PAGE_FETCH_THREADS) as executor:
+            futures = [
+                executor.submit(fetch_forms_for_page, page_id, token)
+                for page_id, token in page_items
+            ]
 
-            for form in forms:
-                form_id = form.get("id")
-                if not form_id:
-                    continue
+            for future in as_completed(futures):
+                result = future.result()
+                page_id = result["page_id"]
+                forms = result["forms"]
 
-                log(f"📄 Importing form: {form_id}")
+                page_name = PAGE_NAMES.get(page_id, "Unknown")
+                log(f"📘 Page Loaded → {page_name} | Forms → {len(forms)}")
 
-                url = f"https://graph.facebook.com/v25.0/{form_id}/leads"
-                params = {"access_token": token, "limit": 100}
+                for form in forms:
+                    form_id = form.get("id")
+                    if form_id:
+                        all_page_forms.append((page_id, PAGE_TOKENS.get(page_id), form_id))
 
-                while url:
-                    res = safe_get(url, params=params)
-                    if not res:
-                        break
+        log(f"🧾 Total forms discovered → {len(all_page_forms)}")
 
-                    data = res.json()
+        # -----------------------------------------
+        # STEP 2: Fetch all leads from all forms in parallel
+        # -----------------------------------------
+        def import_one_form(page_id, token, form_id):
+            leads = get_all_form_leads_full(form_id, token)
+            return {
+                "page_id": page_id,
+                "form_id": form_id,
+                "leads": leads
+            }
 
-                    if "error" in data:
-                        log_error(f"❌ Leads fetch failed for form {form_id}")
-                        break
+        with ThreadPoolExecutor(max_workers=FORM_FETCH_THREADS) as executor:
+            futures = [
+                executor.submit(import_one_form, page_id, token, form_id)
+                for page_id, token, form_id in all_page_forms
+            ]
 
-                    leads = data.get("data", [])
-                    if leads:
-                        log(f"📦 Batch: {len(leads)}")
+            for future in as_completed(futures):
+                result = future.result()
+                page_id = result["page_id"]
+                form_id = result["form_id"]
+                leads = result["leads"]
 
-                    for lead in leads:
-                        lead_id = lead.get("id")
-                        if lead_id:
-                            LEAD_QUEUE.put({"lead_id": lead_id, "page_id": page_id})
+                log(f"📄 Imported form → {form_id} | Leads → {len(leads)}")
 
-                    url = data.get("paging", {}).get("next")
-                    params = None
+                for lead in leads:
+                    lead_id = lead.get("id")
+                    if lead_id:
+                        LEAD_QUEUE.put({"lead_id": lead_id, "page_id": page_id})
 
         LEAD_QUEUE.join()
         flush_buffer()
 
         IMPORT_DONE = True
-        log("✅ Historical import completed")
+        log("✅ Historical import completed (parallel)")
 
     except Exception as e:
-        log_error(f"❌ Historical import failed: {e}")
+        log_error(f"❌ Historical import failed → {e}")
 
 
 # =========================================================
-# POLLING BACKUP
+# POLLING BACKUP (PARALLEL)
 # =========================================================
 def poll():
     while True:
         try:
             if not IMPORT_DONE:
-                log("⏳ Waiting for historical import...")
                 time.sleep(30)
                 continue
 
-            log("🔄 Polling backup check...")
+            log("🔄 Polling backup check (parallel mode)...")
 
             load_pages(force=True)
 
-            for page_id, token in PAGE_TOKENS.items():
-                forms = get_forms(page_id, token)
+            page_items = list(PAGE_TOKENS.items())
+            all_page_forms = []
 
-                for form in forms:
-                    form_id = form.get("id")
-                    if not form_id:
-                        continue
+            # -----------------------------------------
+            # STEP 1: Fetch all forms from all pages in parallel
+            # -----------------------------------------
+            with ThreadPoolExecutor(max_workers=PAGE_FETCH_THREADS) as executor:
+                futures = [
+                    executor.submit(fetch_forms_for_page, page_id, token)
+                    for page_id, token in page_items
+                ]
 
-                    res = safe_get(
-                        f"https://graph.facebook.com/v25.0/{form_id}/leads",
-                        params={"access_token": token, "limit": 3}
-                    )
+                for future in as_completed(futures):
+                    result = future.result()
+                    page_id = result["page_id"]
+                    forms = result["forms"]
 
-                    if not res:
-                        continue
+                    page_name = PAGE_NAMES.get(page_id, "Unknown")
+                    log(f"📘 Poll page → {page_name} | Forms → {len(forms)}")
 
-                    data = res.json()
+                    for form in forms:
+                        form_id = form.get("id")
+                        if form_id:
+                            all_page_forms.append((page_id, PAGE_TOKENS.get(page_id), form_id))
 
-                    for lead in data.get("data", []):
+            log(f"🧾 Poll total forms → {len(all_page_forms)}")
+
+            # -----------------------------------------
+            # STEP 2: Fetch latest leads from all forms in parallel
+            # -----------------------------------------
+            def poll_one_form(page_id, token, form_id):
+                leads = get_form_leads_page(form_id, token, limit=5)
+                return {
+                    "page_id": page_id,
+                    "form_id": form_id,
+                    "leads": leads
+                }
+
+            with ThreadPoolExecutor(max_workers=LEAD_FETCH_THREADS) as executor:
+                futures = [
+                    executor.submit(poll_one_form, page_id, token, form_id)
+                    for page_id, token, form_id in all_page_forms
+                ]
+
+                for future in as_completed(futures):
+                    result = future.result()
+                    page_id = result["page_id"]
+                    form_id = result["form_id"]
+                    leads = result["leads"]
+
+                    if leads:
+                        log(f"📄 Poll form → {form_id} | Leads → {len(leads)}")
+
+                    for lead in leads:
                         lead_id = lead.get("id")
                         if lead_id:
                             LEAD_QUEUE.put({"lead_id": lead_id, "page_id": page_id})
@@ -737,7 +918,7 @@ def poll():
             flush_buffer()
 
         except Exception as e:
-            log_error(f"❌ Polling error: {e}")
+            log_error(f"❌ Polling error → {e}")
 
         time.sleep(POLL_INTERVAL_SECONDS)
 
@@ -754,7 +935,7 @@ def start_polling():
 
 
 # =========================================================
-# HEALTH / DEBUG
+# HEALTH
 # =========================================================
 @router.get("/api/health/crm")
 def crm_health():
@@ -764,25 +945,9 @@ def crm_health():
         "workers_started": WORKERS_STARTED,
         "import_done": IMPORT_DONE,
         "buffer_size": len(INSERT_BUFFER),
-        "queue_size": LEAD_QUEUE.qsize()
+        "queue_size": LEAD_QUEUE.qsize(),
+        "webhook_queue_size": WEBHOOK_QUEUE.qsize()
     }
-
-
-@router.post("/api/test-webhook")
-async def test_webhook():
-    log("🔥 Test webhook hit")
-    return {"status": "ok"}
-
-
-@router.post("/api/post-check")
-async def post_check(request: Request):
-    try:
-        raw_body = await request.body()
-        log(f"🧪 POST check received")
-        return {"status": "ok", "size": len(raw_body)}
-    except Exception as e:
-        log_error(f"❌ POST check failed: {e}")
-        return {"status": "error"}
 
 
 # =========================================================
@@ -803,7 +968,7 @@ async def verify(request: Request):
 
 
 # =========================================================
-# META WEBHOOK RECEIVE
+# META WEBHOOK RECEIVE (FAST ACK)
 # =========================================================
 @router.post("/api/switrus_engine")
 async def webhook(request: Request):
@@ -813,7 +978,7 @@ async def webhook(request: Request):
         try:
             body = json.loads(raw_body.decode("utf-8"))
         except Exception as e:
-            log_error(f"❌ Invalid webhook JSON: {e}")
+            log_error(f"❌ Invalid webhook JSON → {e}")
             return {"status": "bad_json"}
 
         events_found = 0
@@ -832,21 +997,22 @@ async def webhook(request: Request):
                 if lead_id and page_id:
                     events_found += 1
 
-                    # WEBHOOK = FIRST PRIORITY = INSTANT SAVE
-                    threading.Thread(
-                        target=process_webhook_lead,
-                        args=(lead_id, page_id),
-                        daemon=True
-                    ).start()
-
-                    log(f"⚡ New webhook lead: {lead_id}")
+                    # 🔥 ACK FAST → queue immediately
+                    try:
+                        WEBHOOK_QUEUE.put_nowait({
+                            "lead_id": lead_id,
+                            "page_id": page_id
+                        })
+                        log(f"⚡ Webhook queued instantly → {lead_id}")
+                    except Exception as qe:
+                        log_error(f"❌ Webhook queue failed → {lead_id} | {qe}")
 
         if events_found == 0:
             log("ℹ Webhook received but no lead events found")
         else:
-            log(f"📥 Webhook processed {events_found} lead event(s)")
+            log(f"📥 Webhook ACK sent immediately for {events_found} lead event(s)")
 
     except Exception as e:
-        log_error(f"❌ Webhook handler failed: {e}")
+        log_error(f"❌ Webhook handler failed → {e}")
 
     return {"status": "ok"}

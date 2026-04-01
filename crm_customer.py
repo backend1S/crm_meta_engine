@@ -1,6 +1,8 @@
 import time
 import re
 import logging
+from collections import defaultdict
+
 from database import Database
 
 
@@ -9,6 +11,10 @@ logger = logging.getLogger("crm_customer")
 
 def log(msg):
     logger.info(msg)
+
+
+def log_error(msg):
+    logger.error(msg)
 
 
 # =========================================================
@@ -55,9 +61,6 @@ def parse_pax(value):
 # CONTACT MODE NORMALIZER
 # =========================================================
 def get_exact_contact_mode(value):
-    """
-    Keep original if valid, otherwise normalize weird Meta test junk.
-    """
     value = clean_text(value, 50).lower()
 
     if not value:
@@ -75,11 +78,9 @@ def get_exact_contact_mode(value):
         "messenger": "messenger",
     }
 
-    # exact known mapping
     if value in replacements:
         return replacements[value]
 
-    # reject obvious Meta test garbage
     if "<test lead" in value or "dummy" in value or "test" in value:
         return "other"
 
@@ -87,232 +88,229 @@ def get_exact_contact_mode(value):
 
 
 # =========================================================
-# BRANCH / CRE HELPERS
+# CACHE LOADERS (FAST)
 # =========================================================
-def get_branch_id(city):
+def load_branch_map():
     db = Database()
+    sql = "SELECT BRANCH_ID, CITY FROM BRANCH_MASTER"
+    status, rows = db.db_query(sql)
+
+    branch_map = []
+    if status and rows:
+        for row in rows:
+            branch_id = clean_text(row[0], 20)
+            branch_city = clean_text(row[1], 100).lower()
+            if branch_id and branch_city:
+                branch_map.append((branch_city, branch_id))
+
+    return branch_map
+
+
+def get_branch_id(city, branch_map):
     city = clean_text(city, 100).lower()
 
     if not city:
         return "B001"
 
-    sql = "SELECT BRANCH_ID, CITY FROM BRANCH_MASTER"
-    status, rows = db.db_query(sql)
-
-    if not status or not rows:
-        return "B001"
-
-    for row in rows:
-        branch_id = clean_text(row[0], 20)
-        branch_city = clean_text(row[1], 100).lower()
-
+    for branch_city, branch_id in branch_map:
         if branch_city in city or city in branch_city:
             return branch_id
 
     return "B001"
 
 
-def get_next_cre_by_branch(branch_id):
+def load_cre_map():
     db = Database()
 
-    sql_cre = """
-    SELECT EMPID
+    sql = """
+    SELECT EMPID, BRANCH_ID
     FROM SW_USER
-    WHERE BRANCH_ID = ?
-      AND UPPER(LTRIM(RTRIM(ISNULL(ROLES, '')))) = 'CRE'
+    WHERE UPPER(LTRIM(RTRIM(ISNULL(ROLES, '')))) = 'CRE'
       AND (ISDISABLED IS NULL OR ISDISABLED = 0)
-    ORDER BY EMPID
+    ORDER BY BRANCH_ID, EMPID
     """
 
-    status, rows = db.db_query(sql_cre, [branch_id])
+    status, rows = db.db_query(sql)
 
-    if not status or not rows:
-        return None
+    cre_map = defaultdict(list)
 
-    cre_list = [clean_text(r[0], 50) for r in rows if r[0]]
+    if status and rows:
+        for row in rows:
+            empid = clean_text(row[0], 50)
+            branch_id = clean_text(row[1], 20)
+            if empid and branch_id:
+                cre_map[branch_id].append(empid)
+
+    return cre_map
+
+
+def load_last_cre_map():
+    db = Database()
+
+    sql = """
+    SELECT BRANCH_ID, MAX(CUSTOMER_ID) AS LAST_CUSTOMER_ID
+    FROM CRM_CUSTOMERS
+    WHERE BRANCH_ID IS NOT NULL
+      AND BRANCH_ID <> ''
+    GROUP BY BRANCH_ID
+    """
+
+    status, rows = db.db_query(sql)
+
+    last_cre_map = {}
+
+    if status and rows:
+        for row in rows:
+            branch_id = clean_text(row[0], 20)
+            customer_id = row[1]
+
+            if branch_id and customer_id:
+                sql2 = """
+                SELECT TOP 1 CRE_ID
+                FROM CRM_CUSTOMERS
+                WHERE BRANCH_ID = ?
+                ORDER BY CUSTOMER_ID DESC
+                """
+                s2, r2 = db.db_query(sql2, [branch_id])
+                if s2 and r2:
+                    last_cre_map[branch_id] = clean_text(r2[0][0], 50)
+
+    return last_cre_map
+
+
+def get_next_cre_by_branch(branch_id, cre_map, last_cre_map):
+    cre_list = cre_map.get(branch_id, [])
 
     if not cre_list:
         return None
 
-    sql_last = """
-    SELECT TOP 1 CRE_ID
-    FROM CRM_CUSTOMERS
-    WHERE BRANCH_ID = ?
-      AND CRE_ID IS NOT NULL
-      AND CRE_ID <> ''
-    ORDER BY CUSTOMER_ID DESC
-    """
+    last_cre = last_cre_map.get(branch_id)
 
-    status, last_rows = db.db_query(sql_last, [branch_id])
-
-    if not status or not last_rows:
-        return cre_list[0]
-
-    last_cre = clean_text(last_rows[0][0], 50)
-
-    if last_cre not in cre_list:
-        return cre_list[0]
+    if not last_cre or last_cre not in cre_list:
+        chosen = cre_list[0]
+        last_cre_map[branch_id] = chosen
+        return chosen
 
     idx = cre_list.index(last_cre)
     next_idx = (idx + 1) % len(cre_list)
-
-    return cre_list[next_idx]
+    chosen = cre_list[next_idx]
+    last_cre_map[branch_id] = chosen
+    return chosen
 
 
 # =========================================================
-# DUPLICATE CHECKS
+# DUPLICATE CACHE (FAST)
 # =========================================================
-def customer_exists(phone, email):
-    db = Database()
-
-    phone = clean_text(phone, 30)
-    email = clean_text(email, 150)
-
-    if not phone and not email:
-        return False
-
-    if phone and email:
-        sql = """
-        SELECT TOP 1 CUSTOMER_ID
-        FROM CRM_CUSTOMERS
-        WHERE PHONE_NUMBER = ? OR EMAIL = ?
-        """
-        params = [phone, email]
-
-    elif phone:
-        sql = """
-        SELECT TOP 1 CUSTOMER_ID
-        FROM CRM_CUSTOMERS
-        WHERE PHONE_NUMBER = ?
-        """
-        params = [phone]
-
-    else:
-        sql = """
-        SELECT TOP 1 CUSTOMER_ID
-        FROM CRM_CUSTOMERS
-        WHERE EMAIL = ?
-        """
-        params = [email]
-
-    status, rows = db.db_query(sql, params)
-    return bool(status and rows)
-
-
-def is_lead_processed(lead_id):
+def load_existing_customers():
     db = Database()
 
     sql = """
-    SELECT TOP 1 ID
-    FROM LEADS
-    WHERE LEAD_ID = ?
-      AND IS_PROCESSED = 1
+    SELECT PHONE_NUMBER, EMAIL
+    FROM CRM_CUSTOMERS
     """
 
-    status, rows = db.db_query(sql, [clean_text(lead_id, 100)])
-    return bool(status and rows)
+    status, rows = db.db_query(sql)
+
+    phones = set()
+    emails = set()
+
+    if status and rows:
+        for row in rows:
+            phone = clean_text(row[0], 30)
+            email = clean_text(row[1], 150).lower()
+
+            if phone:
+                phones.add(phone)
+            if email:
+                emails.add(email)
+
+    return phones, emails
 
 
-def mark_lead_processed(lead_id):
+# =========================================================
+# FETCH LEADS TO PROCESS
+# =========================================================
+def get_unprocessed_leads(limit=500):
     db = Database()
 
-    sql = """
+    sql = f"""
+    SELECT TOP ({limit}) *
+    FROM LEADS
+    WHERE ISNULL(IS_PROCESSED, 0) = 0
+      AND CREATED_DATE >= DATEADD(DAY, -30, GETDATE())
+    ORDER BY ID ASC
+    """
+
+    status, rows = db.db_query(sql)
+
+    if not status or not rows:
+        return []
+
+    return rows
+
+
+# =========================================================
+# BULK MARK PROCESSED
+# =========================================================
+def bulk_mark_processed(lead_ids):
+    if not lead_ids:
+        return
+
+    db = Database()
+
+    placeholders = ",".join(["?"] * len(lead_ids))
+    sql = f"""
     UPDATE LEADS
     SET
         IS_PROCESSED = 1,
         MODIFIED_DATE = GETDATE()
-    WHERE LEAD_ID = ?
+    WHERE LEAD_ID IN ({placeholders})
     """
 
-    db.db_update(sql, [clean_text(lead_id, 100)])
+    db.db_update(sql, lead_ids)
 
 
 # =========================================================
-# INSERT CUSTOMER
+# BULK INSERT CUSTOMERS
 # =========================================================
-def insert_customer(row):
-    try:
-        db = Database()
+def bulk_insert_customers(rows_to_insert):
+    if not rows_to_insert:
+        return 0
 
-        lead_id = clean_text(row[1], 100)
-        name = clean_text(row[13], 150)
-        phone = clean_text(row[14], 30)
-        email = clean_text(row[15], 150)
-        city = clean_text(row[16], 100)
-        month = clean_text(row[17], 100)
+    db = Database()
 
-        contact_mode = get_exact_contact_mode(row[18])
-        pax = parse_pax(row[19])
-        platform = clean_text(row[12], 50)
+    sql = """
+    INSERT INTO CRM_CUSTOMERS
+    (
+        CUSTOMER_NAME,
+        PHONE_NUMBER,
+        EMAIL,
+        CRE_ID,
+        PACKAGE,
+        MONTH,
+        PAX,
+        CONTACT_MODE,
+        STATUS,
+        REMARK,
+        CREATED_DATE,
+        MODIFIED_DATE,
+        BRANCH_ID,
+        PLATFORM
+    )
+    VALUES
+    (
+        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, GETDATE(), GETDATE(), ?, ?
+    )
+    """
 
-        branch_id = get_branch_id(city)
-        cre_id = get_next_cre_by_branch(branch_id)
+    status, result = db.db_executemany(sql, rows_to_insert)
 
-        log(f"👤 Lead → {name} | {phone}")
-        log(f"📞 Contact Mode (Safe) → {contact_mode}")
-        log(f"🌐 Platform → {platform}")
-        log(f"📍 Branch → {branch_id} | 🎯 CRE → {cre_id}")
+    if status:
+        log(f"👥 CRM Customers inserted → {len(rows_to_insert)}")
+        return len(rows_to_insert)
 
-        if not phone and not email:
-            return
-
-        if is_lead_processed(lead_id):
-            return
-
-        if customer_exists(phone, email):
-            log(f"⚠ Duplicate skipped → {phone or email}")
-            mark_lead_processed(lead_id)
-            return
-
-        sql = """
-        INSERT INTO CRM_CUSTOMERS
-        (
-            CUSTOMER_NAME,
-            PHONE_NUMBER,
-            EMAIL,
-            CRE_ID,
-            PACKAGE,
-            MONTH,
-            PAX,
-            CONTACT_MODE,
-            STATUS,
-            REMARK,
-            CREATED_DATE,
-            MODIFIED_DATE,
-            BRANCH_ID,
-            PLATFORM
-        )
-        VALUES
-        (
-            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, GETDATE(), GETDATE(), ?, ?
-        )
-        """
-
-        params = [
-            name,
-            phone,
-            email,
-            cre_id if cre_id else "",
-            "",
-            month,
-            pax,
-            clean_text(contact_mode, 50),   # HARD SAFE LIMIT
-            "Pending",
-            "",
-            branch_id,
-            clean_text(platform, 50)
-        ]
-
-        status, result = db.db_update(sql, params)
-
-        if status:
-            log(f"✅ CRM Customer Created → {name}")
-            mark_lead_processed(lead_id)
-        else:
-            log(f"❌ Insert error → {result}")
-
-    except Exception as e:
-        log(f"❌ Insert exception → {e}")
+    log_error(f"❌ CRM bulk insert failed → {result}")
+    return 0
 
 
 # =========================================================
@@ -321,7 +319,6 @@ def insert_customer(row):
 def repair_old_customer_data():
     db = Database()
 
-    # Fix CONTACT_MODE safely
     sql1 = """
     UPDATE C
     SET
@@ -387,26 +384,79 @@ def repair_old_customer_data():
 
 
 # =========================================================
-# PROCESS LEADS
+# FAST PROCESS LEADS
 # =========================================================
 def process_leads():
-    db = Database()
+    rows = get_unprocessed_leads(limit=500)
 
-    sql = """
-    SELECT *
-    FROM LEADS
-    WHERE ISNULL(IS_PROCESSED, 0) = 0
-      AND CREATED_DATE >= DATEADD(DAY, -30, GETDATE())
-    ORDER BY ID ASC
-    """
-
-    status, rows = db.db_query(sql)
-
-    if not status or not rows:
+    if not rows:
         return
 
+    branch_map = load_branch_map()
+    cre_map = load_cre_map()
+    last_cre_map = load_last_cre_map()
+    existing_phones, existing_emails = load_existing_customers()
+
+    rows_to_insert = []
+    processed_lead_ids = []
+
     for row in rows:
-        insert_customer(row)
+        try:
+            lead_id = clean_text(row[1], 100)
+            name = clean_text(row[13], 150)
+            phone = clean_text(row[14], 30)
+            email = clean_text(row[15], 150).lower()
+            city = clean_text(row[16], 100)
+            month = clean_text(row[17], 100)
+
+            contact_mode = get_exact_contact_mode(row[18])
+            pax = parse_pax(row[19])
+            platform = clean_text(row[12], 50)
+
+            if not phone and not email:
+                processed_lead_ids.append(lead_id)
+                continue
+
+            # duplicate check from in-memory cache
+            if (phone and phone in existing_phones) or (email and email in existing_emails):
+                log(f"⚠ Duplicate skipped → {phone or email}")
+                processed_lead_ids.append(lead_id)
+                continue
+
+            branch_id = get_branch_id(city, branch_map)
+            cre_id = get_next_cre_by_branch(branch_id, cre_map, last_cre_map)
+
+            rows_to_insert.append((
+                name,
+                phone,
+                email,
+                cre_id if cre_id else "",
+                "",
+                month,
+                pax,
+                clean_text(contact_mode, 50),
+                "Pending",
+                "",
+                branch_id,
+                platform
+            ))
+
+            processed_lead_ids.append(lead_id)
+
+            if phone:
+                existing_phones.add(phone)
+            if email:
+                existing_emails.add(email)
+
+        except Exception as e:
+            log_error(f"❌ Lead process failed → {e}")
+
+    inserted = bulk_insert_customers(rows_to_insert)
+
+    if processed_lead_ids:
+        bulk_mark_processed(processed_lead_ids)
+
+    log(f"✅ CRM sync processed → leads={len(rows)} | inserted={inserted} | marked={len(processed_lead_ids)}")
 
 
 # =========================================================
@@ -415,11 +465,19 @@ def process_leads():
 def start_crm_customer_sync():
     log("🚀 CRM Customer Sync Started")
 
+    repair_counter = 0
+
     while True:
         try:
             process_leads()
-            repair_old_customer_data()
+
+            # run heavy repair less often
+            repair_counter += 1
+            if repair_counter >= 30:   # every ~5 min if sleep=10
+                repair_old_customer_data()
+                repair_counter = 0
+
         except Exception as e:
-            log(f"❌ CRM Sync Error → {e}")
+            log_error(f"❌ CRM Sync Error → {e}")
 
         time.sleep(10)
