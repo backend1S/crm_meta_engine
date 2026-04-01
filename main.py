@@ -15,7 +15,7 @@ from crm_customer import start_crm_customer_sync
 # ==========================================
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 logger = logging.getLogger("main")
 
@@ -54,11 +54,8 @@ def delayed_start():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("🚀 CRM Lead Engine starting...")
-
     threading.Thread(target=delayed_start, daemon=True).start()
-
     yield
-
     logger.info("🛑 CRM Lead Engine stopped")
 
 
