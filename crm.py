@@ -59,7 +59,7 @@ if not USER_ACCESS_TOKEN:
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "50"))
 WORKER_COUNT = int(os.getenv("WORKER_COUNT", "4"))
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "15"))
-POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "600"))
+POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "60"))
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", "2"))
 BUFFER_FLUSH_SECONDS = int(os.getenv("BUFFER_FLUSH_SECONDS", "10"))
 
@@ -887,7 +887,7 @@ def poll():
             # STEP 2: Fetch latest leads from all forms in parallel
             # -----------------------------------------
             def poll_one_form(page_id, token, form_id):
-                leads = get_form_leads_page(form_id, token, limit=5)
+                leads = get_form_leads_page(form_id, token, limit=100)
                 return {
                     "page_id": page_id,
                     "form_id": form_id,
